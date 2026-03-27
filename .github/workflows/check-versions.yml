@@ -1,0 +1,145 @@
+name: Check for Version Updates
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get versions
+        id: versions
+        run: |
+          # Current versions
+          CURRENT_SPT=$(grep "^ARG SPT_VERSION=" Dockerfile | head -n1 | cut -d'=' -f2)
+          CURRENT_FIKA=$(grep "^ARG FIKA_VERSION=" Dockerfile | head -n1 | cut -d'=' -f2)
+
+          # Latest versions
+          chmod +x ./scripts/get-spt-version.sh
+          LATEST_SPT=$(./scripts/get-spt-version.sh latest)
+          LATEST_FIKA=$(curl -s https://api.github.com/repos/project-fika/Fika-Server-CSharp/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+
+          # Extract version numbers
+          SPT_VERSION_NUM=$(echo ${LATEST_SPT} | cut -d'-' -f1)
+
+          # Output
+          echo "current_spt=${CURRENT_SPT}" >> $GITHUB_OUTPUT
+          echo "current_fika=${CURRENT_FIKA}" >> $GITHUB_OUTPUT
+          echo "latest_spt=${LATEST_SPT}" >> $GITHUB_OUTPUT
+          echo "latest_fika=${LATEST_FIKA}" >> $GITHUB_OUTPUT
+          echo "spt_version=${SPT_VERSION_NUM}" >> $GITHUB_OUTPUT
+
+          # Determine action
+          if [ "$CURRENT_SPT" != "$LATEST_SPT" ]; then
+            echo "action=spt" >> $GITHUB_OUTPUT
+            echo "SPT update: ${CURRENT_SPT} → ${LATEST_SPT}"
+          elif [ "$CURRENT_FIKA" != "$LATEST_FIKA" ]; then
+            echo "action=fika" >> $GITHUB_OUTPUT
+            echo "Fika update: ${CURRENT_FIKA} → ${LATEST_FIKA}"
+          else
+            echo "action=none" >> $GITHUB_OUTPUT
+            echo "All versions up to date"
+          fi
+
+      # SPT Update - Push to branch
+      - name: Update versions and push to branch
+        if: steps.versions.outputs.action == 'spt'
+        run: |
+          chmod +x ./update-version.sh
+          ./update-version.sh
+
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create and push branch
+          BRANCH="update-spt-${{ steps.versions.outputs.spt_version }}"
+          git checkout -b "$BRANCH"
+          git add Dockerfile Dockerfile.multiarch entrypoint.sh
+          git commit -m "Update to SPT ${{ steps.versions.outputs.latest_spt }} / Fika ${{ steps.versions.outputs.latest_fika }}" \
+            -m "SPT: ${{ steps.versions.outputs.current_spt }} → ${{ steps.versions.outputs.latest_spt }}" \
+            -m "Fika: ${{ steps.versions.outputs.current_fika }} → ${{ steps.versions.outputs.latest_fika }}" \
+            -m "" \
+            -m "After merging, tag as: ${{ steps.versions.outputs.spt_version }}"
+          git push -u origin "$BRANCH"
+
+          echo "Branch '$BRANCH' created and pushed"
+          echo "Create a PR manually from: https://github.com/${{ github.repository }}/compare/${BRANCH}"
+
+      # Fika-Only Update
+      - name: Auto-update Fika
+        if: steps.versions.outputs.action == 'fika'
+        run: |
+          SPT_VERSION="${{ steps.versions.outputs.spt_version }}"
+          OLD_FIKA="${{ steps.versions.outputs.current_fika }}"
+          NEW_FIKA="${{ steps.versions.outputs.latest_fika }}"
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+
+          # Archive current tag if it exists
+          if git rev-parse "$SPT_VERSION" >/dev/null 2>&1; then
+            ARCHIVE_TAG="${SPT_VERSION}-fika${OLD_FIKA}-${TIMESTAMP}"
+            git tag -a "${ARCHIVE_TAG}" "$SPT_VERSION" -m "Archive of SPT ${SPT_VERSION} with Fika ${OLD_FIKA}"
+            git push origin "${ARCHIVE_TAG}"
+            echo "Archived as ${ARCHIVE_TAG}"
+          fi
+
+          # Update files
+          sed -i "s/^ARG FIKA_VERSION=.*/ARG FIKA_VERSION=${NEW_FIKA}/" Dockerfile Dockerfile.multiarch
+          sed -i "s/^fika_version=\${FIKA_VERSION:-.*\}/fika_version=\${FIKA_VERSION:-${NEW_FIKA}\}/" entrypoint.sh
+
+          # Commit and push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Dockerfile Dockerfile.multiarch entrypoint.sh
+          git commit -m "Auto-update Fika to ${NEW_FIKA}" -m "Fika: ${OLD_FIKA} → ${NEW_FIKA}" -m "SPT: ${SPT_VERSION} (unchanged)"
+          git push
+
+          # Update tag
+          git tag -d "${SPT_VERSION}" || true
+          git push origin ":refs/tags/${SPT_VERSION}" || true
+          git tag -a "${SPT_VERSION}" -m "SPT ${SPT_VERSION} with Fika ${NEW_FIKA}"
+          git push origin "${SPT_VERSION}"
+
+          echo "Tag ${SPT_VERSION} updated to Fika ${NEW_FIKA}"
+
+      # Summary
+      - name: Job Summary
+        if: always()
+        run: |
+          ACTION="${{ steps.versions.outputs.action }}"
+
+          case "$ACTION" in
+            spt)
+              echo "## 📦 SPT Update Branch Created" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**SPT**: ${{ steps.versions.outputs.current_spt }} → ${{ steps.versions.outputs.latest_spt }}" >> $GITHUB_STEP_SUMMARY
+              echo "**Fika**: ${{ steps.versions.outputs.current_fika }} → ${{ steps.versions.outputs.latest_fika }}" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Branch \`update-spt-${{ steps.versions.outputs.spt_version }}\` has been pushed" >> $GITHUB_STEP_SUMMARY
+              echo "Create a PR manually and tag as \`${{ steps.versions.outputs.spt_version }}\` after merging" >> $GITHUB_STEP_SUMMARY
+              ;;
+            fika)
+              echo "## 🤖 Fika Auto-Updated" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**SPT**: ${{ steps.versions.outputs.spt_version }} (unchanged)" >> $GITHUB_STEP_SUMMARY
+              echo "**Fika**: ${{ steps.versions.outputs.current_fika }} → ${{ steps.versions.outputs.latest_fika }}" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "✅ Files updated and tag \`${{ steps.versions.outputs.spt_version }}\` moved" >> $GITHUB_STEP_SUMMARY
+              ;;
+            none)
+              echo "## ✓ All Versions Up to Date" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "**SPT**: ${{ steps.versions.outputs.current_spt }}" >> $GITHUB_STEP_SUMMARY
+              echo "**Fika**: ${{ steps.versions.outputs.current_fika }}" >> $GITHUB_STEP_SUMMARY
+              ;;
+          esac
